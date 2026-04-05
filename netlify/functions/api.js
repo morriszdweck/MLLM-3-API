@@ -12684,10 +12684,109 @@ A curious engaged mind that continues learning builds cognitive reserve that pro
   `
 };
 
+// ─── THE MLLM ENGINE ───
+// This class must be defined before the "models" variable is used.
+class MLLM {
+  constructor(contextWindow = 50) {
+    this.tokens = [];
+    this.contextWindow = contextWindow;
+    this.vocabulary = new Set();
+    this.ngramModels = {};
+    this.tokenFreq = new Map();
+    this.trained = false;
+    this.contextHistory = [];
+  }
+
+  tokenize(text) {
+    text = text.toLowerCase();
+    const matches = text.match(/\b\w+\b|[.!?,;:'"()]/g);
+    return matches ? matches.filter(t => t.trim().length > 0) : [];
+  }
+
+  _buildNgramModel(n) {
+    const model = new Map();
+    for (let i = 0; i < this.tokens.length - n; i++) {
+      const key = JSON.stringify(this.tokens.slice(i, i + n));
+      const next = this.tokens[i + n];
+      if (!model.has(key)) model.set(key, new Map());
+      const inner = model.get(key);
+      inner.set(next, (inner.get(next) || 0) + 1);
+    }
+    return model;
+  }
+
+  async train(corpus) {
+    this.tokens = this.tokenize(corpus);
+    this.vocabulary = new Set(this.tokens);
+    for (const t of this.tokens) {
+      this.tokenFreq.set(t, (this.tokenFreq.get(t) || 0) + 1);
+    }
+    this.ngramModels = {};
+    for (let n = 1; n <= 20; n++) {
+      this.ngramModels[n] = this._buildNgramModel(n);
+    }
+    this.trained = true;
+  }
+
+  _getNgramPrediction(contextTokens, n) {
+    if (n > contextTokens.length) return null;
+    const key = JSON.stringify(contextTokens.slice(-n));
+    return this.ngramModels[n]?.get(key) || null;
+  }
+
+  _weightedRandomChoice(predictions, temperature = 0.8) {
+    if (!predictions || predictions.size === 0) {
+      const vocab = [...this.vocabulary];
+      return vocab[Math.floor(Math.random() * vocab.length)];
+    }
+    const words = [...predictions.keys()];
+    const counts = [...predictions.values()];
+    const total = counts.reduce((a, b) => a + b, 0);
+    let probs = counts.map(c => Math.pow(c / total, 1 / temperature));
+    const probSum = probs.reduce((a, b) => a + b, 0);
+    probs = probs.map(p => p / probSum);
+
+    let rand = Math.random(), cumulative = 0;
+    for (let i = 0; i < words.length; i++) {
+      cumulative += probs[i];
+      if (rand <= cumulative) return words[i];
+    }
+    return words[words.length - 1];
+  }
+
+  predictNextWord(context, temperature = 0.8) {
+    const contextTokens = this.tokenize(context);
+    for (let n = Math.min(20, contextTokens.length); n >= 1; n--) {
+      const preds = this._getNgramPrediction(contextTokens, n);
+      if (preds) return this._weightedRandomChoice(preds, temperature);
+    }
+    return this.vocabulary.size > 0 ? [...this.vocabulary][0] : '?';
+  }
+
+  generateResponse(userInput, maxLength = 30, temperature = 0.8) {
+    if (!this.trained) return 'Error: Model not trained.';
+    let responseTokens = this.tokenize(userInput);
+    
+    for (let i = 0; i < maxLength; i++) {
+      const next = this.predictNextWord(responseTokens.join(' '), temperature);
+      if (['.', '!', '?'].includes(next)) { 
+        responseTokens.push(next); 
+        break; 
+      }
+      responseTokens.push(next);
+    }
+
+    return responseTokens.join(' ')
+      .replace(/ \./g, '.').replace(/ !/g, '!').replace(/ \?/g, '?')
+      .replace(/ ,/g, ',').replace(/ ;/g, ';');
+  }
+}
+
+// ─── HANDLER LOGIC ───
 let models = null;
 
 async function initializeModels() {
-  if (models) return; // Use cached models if the function is warm
+  if (models) return; 
   
   models = {
     mllm3: new MLLM(50),
@@ -12703,61 +12802,39 @@ async function initializeModels() {
   }));
 }
 
-exports.handler = async (event, context) => {
-  // Allow GET requests so we can use URL parameters
+exports.handler = async (event) => {
   if (event.httpMethod !== 'GET') {
-    return { statusCode: 405, body: 'Method Not Allowed. Please use a GET request.' };
+    return { statusCode: 405, body: 'Use GET requests.' };
   }
 
   try {
-    // Netlify automatically decodes URL parameters and places them here
     const params = event.queryStringParameters || {};
-    
-    // Extract parameters with fallbacks
     const model = params.model || 'mllm3';
     const prompt = params.prompt || '';
     const maxTokens = parseInt(params.maxTokens) || 30;
     const temperature = parseFloat(params.temperature) || 0.8;
 
     if (!prompt) {
-      return { statusCode: 400, body: JSON.stringify({ error: 'Please provide a prompt parameter in the URL.' }) };
+      return { statusCode: 400, body: JSON.stringify({ error: 'Missing prompt.' }) };
     }
 
-    // Train the models if it's a cold start
     await initializeModels();
 
     if (!models[model]) {
-      return { 
-        statusCode: 400, 
-        body: JSON.stringify({ error: 'Invalid model. Use mllm3, mllm3flash, mllm3micro, or mllm3max.' }) 
-      };
+      return { statusCode: 400, body: JSON.stringify({ error: 'Invalid model ID.' }) };
     }
 
-    if (!models[model].trained) {
-       return { 
-         statusCode: 500, 
-         body: JSON.stringify({ error: `Model ${model} not trained. Ensure the corpus is populated.` }) 
-       };
-    }
-
-    // Generate the response
     const responseText = models[model].generateResponse(prompt, maxTokens, temperature);
 
     return {
       statusCode: 200,
-      headers: { 
-        'Content-Type': 'application/json',
-        // Optional: add CORS headers if you want to call this from other web domains
-        'Access-Control-Allow-Origin': '*' 
-      },
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       body: JSON.stringify({
         model: model,
-        prompt: prompt,
-        response: responseText,
-        tokens_generated: responseText.split(' ').length
+        response: responseText
       })
     };
-  } catch (error) {
-    return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
+  } catch (err) {
+    return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
   }
 };
